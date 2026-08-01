@@ -1,307 +1,149 @@
 /*
- * Copyright (c) 2019 Vestas Wind Systems A/S
+ * CANopenNode v4.x — minimal Zephyr sample.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/can.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/reboot.h>
-#include <zephyr/settings/settings.h>
-#include <canopennode.h>
+#include <CANopen.h>
+#include "OD.h"
 
-#define LOG_LEVEL CONFIG_CANOPENNODE_LOG_LEVEL
+#define LOG_LEVEL LOG_LEVEL_INF
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(app);
 
-#define CAN_INTERFACE DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus))
-#define CAN_BITRATE (DT_PROP_OR(DT_CHOSEN(zephyr_canbus), bitrate, \
-					  DT_PROP_OR(DT_CHOSEN(zephyr_canbus), bus_speed, \
-						     CONFIG_CAN_DEFAULT_BITRATE)) / 1000)
+#define CAN_DEV   DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus))
+#define BITRATE   ((DT_PROP_OR(DT_CHOSEN(zephyr_canbus), bitrate, \
+                    DT_PROP_OR(DT_CHOSEN(zephyr_canbus), bus_speed, \
+                    CONFIG_CAN_DEFAULT_BITRATE))) / 1000)
 
-static struct gpio_dt_spec led_green_gpio = GPIO_DT_SPEC_GET_OR(
-		DT_ALIAS(green_led), gpios, {0});
-static struct gpio_dt_spec led_red_gpio = GPIO_DT_SPEC_GET_OR(
-		DT_ALIAS(red_led), gpios, {0});
+#define NMT_CONTROL (CO_NMT_STARTUP_TO_OPERATIONAL       \
+                     | CO_NMT_ERR_ON_ERR_REG              \
+                     | CO_ERR_REG_GENERIC_ERR             \
+                     | CO_ERR_REG_COMMUNICATION)
+#define FIRST_HB_TIME        500
+#define SDO_SRV_TIMEOUT_TIME 1000
+#define SDO_CLI_TIMEOUT_TIME 500
+#define SDO_CLI_BLOCK        false
 
-static struct gpio_dt_spec button_gpio = GPIO_DT_SPEC_GET_OR(
-		DT_ALIAS(sw0), gpios, {0});
-static struct gpio_callback button_callback;
+CO_t *CO = NULL;
 
-struct led_indicator {
-	const struct device *dev;
-	gpio_pin_t pin;
-};
+#ifdef CONFIG_CANOPENNODE_LEDS
+void canopen_leds_init(CO_NMT_t *nmt,
+		       void (*g)(bool, void *), void *ga,
+		       void (*r)(bool, void *), void *ra);
 
-static uint32_t counter;
+static struct gpio_dt_spec led_g = GPIO_DT_SPEC_GET_OR(DT_ALIAS(led1), gpios, {0});
+static struct gpio_dt_spec led_r = GPIO_DT_SPEC_GET_OR(DT_ALIAS(led0), gpios, {0});
 
-/**
- * @brief Callback for setting LED indicator state.
- *
- * @param value true if the LED indicator shall be turned on, false otherwise.
- * @param arg argument that was passed when LEDs were initialized.
- */
-static void led_callback(bool value, void *arg)
+static void led_set(bool on, void *arg)
 {
-	struct gpio_dt_spec *led_gpio = arg;
-
-	if (!led_gpio || !led_gpio->port) {
-		return;
-	}
-
-	gpio_pin_set_dt(led_gpio, value);
+	struct gpio_dt_spec *l = arg;
+	if (l && l->port) gpio_pin_set_dt(l, on);
 }
 
-/**
- * @brief Configure LED indicators pins and callbacks.
- *
- * This routine configures the GPIOs for the red and green LEDs (if
- * available).
- *
- * @param nmt CANopenNode NMT object.
- */
-static void config_leds(CO_NMT_t *nmt)
+static void led_init(CO_NMT_t *nmt)
 {
-	int err;
-
-	if (!led_green_gpio.port) {
-		LOG_INF("Green LED not available");
-	} else if (!gpio_is_ready_dt(&led_green_gpio)) {
-		LOG_ERR("Green LED device not ready");
-		led_green_gpio.port = NULL;
-	} else {
-		err = gpio_pin_configure_dt(&led_green_gpio,
-					    GPIO_OUTPUT_INACTIVE);
-		if (err) {
-			LOG_ERR("failed to configure Green LED gpio: %d", err);
-			led_green_gpio.port = NULL;
-		}
-	}
-
-	if (!led_red_gpio.port) {
-		LOG_INF("Red LED not available");
-	} else if (!gpio_is_ready_dt(&led_red_gpio)) {
-		LOG_ERR("Red LED device not ready");
-		led_red_gpio.port = NULL;
-	} else {
-		err = gpio_pin_configure_dt(&led_red_gpio,
-					    GPIO_OUTPUT_INACTIVE);
-		if (err) {
-			LOG_ERR("failed to configure Red LED gpio: %d", err);
-			led_red_gpio.port = NULL;
-		}
-	}
-
-	canopen_leds_init(nmt,
-			  led_callback, &led_green_gpio,
-			  led_callback, &led_red_gpio);
+	if (led_g.port && gpio_is_ready_dt(&led_g))
+		gpio_pin_configure_dt(&led_g, GPIO_OUTPUT_INACTIVE);
+	if (led_r.port && gpio_is_ready_dt(&led_r))
+		gpio_pin_configure_dt(&led_r, GPIO_OUTPUT_INACTIVE);
+	/* LEDs are driven by an internal k_timer in canopen_leds.c */
+	canopen_leds_init(nmt, led_set, &led_g, led_set, &led_r);
 }
+#else
+#define led_init(nmt)   do { (void)(nmt); } while (0)
+#endif
 
-/**
- * @brief Button press counter object dictionary handler function.
- *
- * This function is called upon SDO access to the button press counter
- * object (index 0x2102) in the object dictionary.
- *
- * @param odf_arg object dictionary function argument.
- *
- * @return SDO abort code.
- */
-static CO_SDO_abortCode_t odf_2102(CO_ODF_arg_t *odf_arg)
-{
-	uint32_t value;
-
-	value = CO_getUint32(odf_arg->data);
-
-	if (odf_arg->reading) {
-		return CO_SDO_AB_NONE;
-	}
-
-	if (odf_arg->subIndex != 0U) {
-		return CO_SDO_AB_NONE;
-	}
-
-	if (value != 0) {
-		/* Preserve old value */
-		memcpy(odf_arg->data, odf_arg->ODdataStorage, sizeof(uint32_t));
-		return CO_SDO_AB_DATA_TRANSF;
-	}
-
-	LOG_INF("Resetting button press counter");
-	counter = 0;
-
-	return CO_SDO_AB_NONE;
-}
-
-/**
- * @brief Button press interrupt callback.
- *
- * @param port GPIO device struct.
- * @param cb GPIO callback struct.
- * @param pins GPIO pin mask that triggered the interrupt.
- */
-static void button_isr_callback(const struct device *port,
-				struct gpio_callback *cb,
-				uint32_t pins)
-{
-	counter++;
-}
-
-/**
- * @brief Configure button GPIO pin and callback.
- *
- * This routine configures the GPIO for the button (if available).
- */
-static void config_button(void)
-{
-	int err;
-
-	if (button_gpio.port == NULL) {
-		LOG_INF("Button not available");
-		return;
-	}
-
-	if (!gpio_is_ready_dt(&button_gpio)) {
-		LOG_ERR("Button device not ready");
-		return;
-	}
-
-	err = gpio_pin_configure_dt(&button_gpio, GPIO_INPUT);
-	if (err) {
-		LOG_ERR("failed to configure button gpio: %d", err);
-		return;
-	}
-
-	gpio_init_callback(&button_callback, button_isr_callback,
-			   BIT(button_gpio.pin));
-
-	err = gpio_add_callback(button_gpio.port, &button_callback);
-	if (err) {
-		LOG_ERR("failed to add button callback: %d", err);
-		return;
-	}
-
-	err = gpio_pin_interrupt_configure_dt(&button_gpio,
-					      GPIO_INT_EDGE_TO_ACTIVE);
-	if (err) {
-		LOG_ERR("failed to enable button callback: %d", err);
-		return;
-	}
-}
-
-/**
- * @brief Main application entry point.
- *
- * The main application thread is responsible for initializing the
- * CANopen stack and doing the non real-time processing.
- */
 int main(void)
 {
-	CO_NMT_reset_cmd_t reset = CO_RESET_NOT;
 	CO_ReturnError_t err;
-	struct canopen_context can;
-	uint16_t timeout;
-	uint32_t elapsed;
-	int64_t timestamp;
-#ifdef CONFIG_CANOPENNODE_STORAGE
-	int ret;
-#endif /* CONFIG_CANOPENNODE_STORAGE */
+	CO_NMT_reset_cmd_t reset = CO_RESET_NOT;
+	uint32_t heapMemoryUsed = 0;
+	uint32_t errInfo;
+	const struct device *can_dev = CAN_DEV;
+	void *CANptr;
+	uint32_t timePrevious;
 
-	can.dev = CAN_INTERFACE;
-	if (!device_is_ready(can.dev)) {
-		LOG_ERR("CAN interface not ready");
+	if (!device_is_ready(can_dev)) {
+		LOG_ERR("CAN not ready");
 		return 0;
 	}
+	CANptr = (void *)can_dev;
 
-#ifdef CONFIG_CANOPENNODE_STORAGE
-	ret = settings_subsys_init();
-	if (ret) {
-		LOG_ERR("failed to initialize settings subsystem (err = %d)",
-			ret);
+	CO = CO_new(NULL, &heapMemoryUsed);
+	if (!CO) {
+		LOG_ERR("CO_new failed");
 		return 0;
 	}
+	LOG_INF("Allocated %u bytes", heapMemoryUsed);
 
-	ret = settings_load();
-	if (ret) {
-		LOG_ERR("failed to load settings (err = %d)", ret);
-		return 0;
-	}
-#endif /* CONFIG_CANOPENNODE_STORAGE */
-
-	OD_powerOnCounter++;
-
-	config_button();
-
+	/* NMT "reset communication" re-initializes in-place (no MCU reset) */
 	while (reset != CO_RESET_APP) {
-		elapsed =  0U; /* milliseconds */
+		LOG_INF("Reset communication...");
 
-		err = CO_init(&can, CONFIG_CANOPEN_NODE_ID, CAN_BITRATE);
-		if (err != CO_ERROR_NO) {
-			LOG_ERR("CO_init failed (err = %d)", err);
-			return 0;
+		CO_CANsetConfigurationMode(CANptr);
+		CO_CANmodule_disable(CO->CANmodule);
+
+		err = CO_CANinit(CO, CANptr, BITRATE);
+		if (err) { LOG_ERR("CO_CANinit: %d", err); break; }
+
+		err = CO_CANopenInit(CO, NULL, NULL, OD, NULL, NMT_CONTROL,
+				     FIRST_HB_TIME, SDO_SRV_TIMEOUT_TIME,
+				     SDO_CLI_TIMEOUT_TIME, SDO_CLI_BLOCK,
+				     CONFIG_CANOPEN_NODE_ID, &errInfo);
+		if (err != CO_ERROR_NO &&
+		    err != CO_ERROR_NODE_ID_UNCONFIGURED_LSS) {
+			LOG_ERR("CO_CANopenInit: %d (0x%X)", err, errInfo);
+			break;
 		}
 
-		LOG_INF("CANopen stack initialized");
-
-#ifdef CONFIG_CANOPENNODE_STORAGE
-		canopen_storage_attach(CO->SDO[0], CO->em);
-#endif /* CONFIG_CANOPENNODE_STORAGE */
-
-		config_leds(CO->NMT);
-		CO_OD_configure(CO->SDO[0], OD_2102_buttonPressCounter,
-				odf_2102, NULL, 0U, 0U);
-
-		if (IS_ENABLED(CONFIG_CANOPENNODE_PROGRAM_DOWNLOAD)) {
-			canopen_program_download_attach(CO->NMT, CO->SDO[0],
-							CO->em);
+		err = CO_CANopenInitPDO(CO, CO->em, OD,
+					CONFIG_CANOPEN_NODE_ID, &errInfo);
+		if (err != CO_ERROR_NO &&
+		    err != CO_ERROR_NODE_ID_UNCONFIGURED_LSS) {
+			LOG_ERR("CO_CANopenInitPDO: %d (0x%X)", err, errInfo);
+			break;
 		}
 
-		CO_CANsetNormalMode(CO->CANmodule[0]);
+		CO_CANsetNormalMode(CO->CANmodule);
+		led_init(CO->NMT);
+		LOG_INF("Running...");
 
-		while (true) {
-			timeout = 1U; /* default timeout in milliseconds */
-			timestamp = k_uptime_get();
-			reset = CO_process(CO, (uint16_t)elapsed, &timeout);
+		timePrevious = k_uptime_get();
+		reset = CO_RESET_NOT;
 
-			if (reset != CO_RESET_NOT) {
-				break;
+		while (reset == CO_RESET_NOT) {
+			uint32_t timeNow = k_uptime_get();
+			uint32_t timeDiff_us = (timeNow - timePrevious) * 1000U;
+			timePrevious = timeNow;
+
+			/* Mainline processing */
+			reset = CO_process(CO, false, timeDiff_us, NULL);
+			CO_CANmodule_process(CO->CANmodule);
+
+			/* Monitor for CAN bus-off */
+			if (CO_isError(CO->em, CO_EM_CAN_TX_BUS_OFF)) {
+				LOG_WRN("CAN bus-off");
 			}
 
-			if (timeout > 0) {
-				CO_LOCK_OD();
-				OD_buttonPressCounter = counter;
-				CO_UNLOCK_OD();
-
-#ifdef CONFIG_CANOPENNODE_STORAGE
-				ret = canopen_storage_save(
-					CANOPEN_STORAGE_EEPROM);
-				if (ret) {
-					LOG_ERR("failed to save EEPROM");
-				}
-#endif /* CONFIG_CANOPENNODE_STORAGE */
-				/*
-				 * Try to sleep for as long as the
-				 * stack requested and calculate the
-				 * exact time elapsed.
-				 */
-				k_sleep(K_MSEC(timeout));
-				elapsed = (uint32_t)k_uptime_delta(&timestamp);
-			} else {
-				/*
-				 * Do not sleep, more processing to be
-				 * done by the stack.
-				 */
-				elapsed = 0U;
-			}
+			k_sleep(K_MSEC(1));
 		}
 
-		if (reset == CO_RESET_COMM) {
-			LOG_INF("Resetting communication");
-		}
+		LOG_INF("NMT reset request: %d (%s)", reset,
+			reset == CO_RESET_APP ? "reset node" : "reset communication");
 	}
 
-	LOG_INF("Resetting device");
-
-	CO_delete(&can);
-	sys_reboot(SYS_REBOOT_COLD);
+	/* NMT "reset node" (or init failure): full MCU reset */
+	CO_CANsetConfigurationMode(CANptr);
+	CO_delete(CO);
+	CO = NULL;
+	if (reset == CO_RESET_APP) {
+		LOG_INF("Node reset requested, rebooting...");
+		sys_reboot(SYS_REBOOT_COLD);
+	}
+	return 0;
 }

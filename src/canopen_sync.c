@@ -6,6 +6,9 @@
 
 #include <CANopen.h>
 
+/* CO is defined as global in main.c */
+extern CO_t *CO;
+
 static struct k_timer sync_timer;
 static struct k_sem sync_sem;
 static uint32_t last_sync_time; /* cycles */
@@ -59,12 +62,13 @@ static void canopen_sync_thread(void *p1, void *p2, void *p3)
 		elapsed = (uint32_t)k_cyc_to_ns_floor64(delta) / NSEC_PER_USEC;
 		last_sync_time = current_time;
 
-		if (CO && CO->CANmodule[0] && CO->CANmodule[0]->CANnormal) {
-			CO_LOCK_OD();
-			sync = CO_process_SYNC(CO, elapsed);
-			CO_process_RPDO(CO, sync);
-			CO_process_TPDO(CO, sync, elapsed);
-			CO_UNLOCK_OD();
+		if (CO && CO->CANmodule && CO->CANmodule->CANnormal
+		    && !CO->nodeIdUnconfigured) {
+			CO_LOCK_OD(CO->CANmodule);
+			sync = CO_process_SYNC(CO, elapsed, NULL);
+			CO_process_RPDO(CO, sync, elapsed, NULL);
+			CO_process_TPDO(CO, sync, elapsed, NULL);
+			CO_UNLOCK_OD(CO->CANmodule);
 		}
 	}
 }

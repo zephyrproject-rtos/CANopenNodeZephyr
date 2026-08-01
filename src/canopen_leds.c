@@ -1,11 +1,13 @@
 /*
  * Copyright (c) 2019 Vestas Wind Systems A/S
+ * Copyright (c) 2024 Ported to CANopenNode v4.x
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <CANopen.h>
-#include <canopennode.h>
+
+extern CO_t *CO;
 
 struct canopen_leds_state {
 	CO_NMT_t *nmt;
@@ -27,15 +29,27 @@ static void canopen_leds_update(struct k_timer *timer_id)
 
 	ARG_UNUSED(timer_id);
 
-	CO_NMT_blinkingProcess50ms(canopen_leds.nmt);
+	if (CO && CO->LEDs && CO->NMT) {
+		/* Advance LED state by 50ms */
+		CO_LEDs_process(CO->LEDs, 50000, CO->NMT->operatingState,
+				false,				/* LSSconfig */
+				false,				/* ErrCANbusOff */
+				false,				/* ErrCANbusWarn */
+				false,				/* ErrRpdo */
+				false,				/* ErrSync */
+				false,				/* ErrHbCons */
+				false,				/* ErrOther */
+				canopen_leds.program_download,	/* firmwareDownload */
+				NULL);				/* timerNext_us */
 
-	if (canopen_leds.program_download) {
-		green = LED_TRIPLE_FLASH(canopen_leds.nmt);
-	} else {
-		green = LED_GREEN_RUN(canopen_leds.nmt);
+		if (canopen_leds.program_download) {
+			green = CO_LED_GREEN(CO->LEDs, CO_LED_flash_3);
+		} else {
+			green = CO_LED_GREEN(CO->LEDs, CO_LED_CANopen);
+		}
+
+		red = CO_LED_RED(CO->LEDs, CO_LED_CANopen);
 	}
-
-	red = LED_RED_ERROR(canopen_leds.nmt);
 
 #ifdef CONFIG_CANOPENNODE_LEDS_BICOLOR
 	if (red && canopen_leds.red_cb) {
