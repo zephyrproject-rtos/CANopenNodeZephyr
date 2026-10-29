@@ -538,12 +538,13 @@ void CO_CANverifyErrors(CO_CANmodule_t *CANmodule)
 
 static int canopen_init(void)
 {
+	const struct k_work_queue_config cfg = {
+		.name = "canopen_tx_workq",
+	};
 
 	k_work_queue_start(&canopen_tx_workq, canopen_tx_workq_stack,
 			   K_KERNEL_STACK_SIZEOF(canopen_tx_workq_stack),
-			   CONFIG_CANOPENNODE_TX_WORKQUEUE_PRIORITY, NULL);
-
-	k_thread_name_set(&canopen_tx_workq.thread, "canopen_tx_workq");
+			   CONFIG_CANOPENNODE_TX_WORKQUEUE_PRIORITY, &cfg);
 
 	k_work_init(&canopen_tx_queue.work, canopen_tx_retry);
 
